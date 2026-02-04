@@ -342,7 +342,7 @@ def _chunk_scan_chunk_state_bwd_dx(x, dt, dA_cumsum, B, CB, dout, dstates, D=Non
 
 def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, cu_seqlens=None, dt_softplus=False, dt_limit=(0.0, float("inf"))):
     batch, seqlen, nheads, headdim = x.shape
-    _, _, ngroups, dstate = B.shape
+    _, _, ngroups, dstate = B.shape    
     assert nheads % ngroups == 0
     assert B.shape == (batch, seqlen, ngroups, dstate)
     assert x.shape == (batch, seqlen, nheads, headdim)
@@ -355,6 +355,9 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
         assert D.shape == (nheads, headdim) or D.shape == (nheads,)
     if seq_idx is not None:
         assert seq_idx.shape == (batch, seqlen)
+    if cu_seqlens is not None:
+        assert batch == 1, "cu_seqlens is only supported with batch=1 (packed sequences)"
+        assert seq_idx is not None, "seq_idx must be provided when cu_seqlens is not None"
     if B.stride(-1) != 1:
         B = B.contiguous()
     if C.stride(-1) != 1:
@@ -366,7 +369,14 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
     if D is not None and D.stride(-1) != 1:
         D = D.contiguous()
     if initial_states is not None:
-        assert initial_states.shape == (batch, nheads, headdim, dstate)
+        if cu_seqlens is not None:
+            # Per-sequence initial states for packed sequences
+            num_sequences = cu_seqlens.shape[0] - 1
+            assert initial_states.shape == (num_sequences, nheads, headdim, dstate), \
+                f"With cu_seqlens, initial_states shape must be (num_sequences={num_sequences}, nheads={nheads}, headdim={headdim}, dstate={dstate}), got {initial_states.shape}"
+        else:
+            assert initial_states.shape == (batch, nheads, headdim, dstate), \
+                f"initial_states shape mismatch: expected ({batch}, {nheads}, {headdim}, {dstate}), got {initial_states.shape}"
     # # (batch, nchunks, chunk_size, chunk_size) or (batch, nchunks, nheads, chunk_size, chunk_size)
     # dA_cumsum_tmp0, dt_tmp0 = _chunk_cumsum_fwd(dt[:, :147], A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus)
     # dA_cumsum_tmp1, dt_tmp1 = _chunk_cumsum_fwd(dt[:, 147:], A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus)
@@ -378,7 +388,7 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
     # states_tmp2 = _chunk_state_fwd(B[:, 147:256], x[:, 147:256], dt_tmp2, dA_cumsum_tmp2, states_in_fp32=True)
     states, final_states = _state_passing_fwd(rearrange(states, "... p n -> ... (p n)"), dA_cumsum[:, :, :, -1],
                                               initial_states=rearrange(initial_states, "... p n -> ... (p n)") if initial_states is not None else None,
-                                              seq_idx=seq_idx, chunk_size=chunk_size, out_dtype=C.dtype)
+                                              seq_idx=seq_idx, chunk_size=chunk_size, out_dtype=C.dtype, cu_seqlens=cu_seqlens)
     states, final_states = [rearrange(t, "... (p n) -> ... p n", n=dstate) for t in [states, final_states]]
     # states_tmp0 = rearrange(_state_passing_fwd(rearrange(states_tmp0, "... p n -> ... (p n)"), dA_cumsum_tmp0[:, :, :, -1], chunk_size=chunk_size), "... (p n) -> ... p n", n=dstate)
     # states_tmp1 = rearrange(_state_passing_fwd(rearrange(states_tmp1, "... p n -> ... (p n)"), dA_cumsum_tmp1[:, :, :, -1], chunk_size=chunk_size), "... (p n) -> ... p n", n=dstate)
@@ -387,14 +397,16 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
     if cu_seqlens is None:
         return out, out_x, dt, dA_cumsum, states, final_states
     else:
-        assert batch == 1, "passing cu_seqlens to get the varlen states is only supported if batch dimension is 1"
+        # Compute per-sequence final states using cu_seqlens
+        # Note: states already incorporate initial_states (applied in _state_passing_fwd above)
+        # so varlen_states will correctly reflect the initial_states for each sequence
         varlen_states = chunk_state_varlen(B.squeeze(0), x.squeeze(0), dt.squeeze(0), dA_cumsum.squeeze(0),
                                            cu_seqlens, states.squeeze(0))
         return out, out_x, dt, dA_cumsum, states, final_states, varlen_states
 
 
 def _mamba_chunk_scan_combined_bwd(dout, x, dt, A, B, C, out, chunk_size, D=None, z=None,
-                                   dt_bias=None, initial_states=None, dfinal_states=None, seq_idx=None, dt_softplus=False,
+                                   dt_bias=None, initial_states=None, dfinal_states=None, seq_idx=None, cu_seqlens=None, dt_softplus=False,
                                    dt_limit=(0.0, float("inf")),
                                    dx=None, ddt=None, dB=None, dC=None, dz=None, recompute_output=False):
     if dout.stride(-1) != 1:
@@ -442,7 +454,7 @@ def _mamba_chunk_scan_combined_bwd(dout, x, dt, A, B, C, out, chunk_size, D=None
     states = _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=True)
     states, _ = _state_passing_fwd(rearrange(states, "... p n -> ... (p n)"), dA_cumsum[:, :, :, -1],
                                    initial_states=rearrange(initial_states, "... p n -> ... (p n)") if initial_states is not None else None,
-                                   seq_idx=seq_idx, chunk_size=chunk_size)
+                                   seq_idx=seq_idx, chunk_size=chunk_size, cu_seqlens=cu_seqlens)
     states = rearrange(states, "... (p n) -> ... p n", n=dstate)
     if z is not None:
         dz, dout, dD, *rest = _chunk_scan_bwd_dz(x, z, out, dout, chunk_size=chunk_size, has_ddAcs=False, D=D, dz=dz, recompute_output=recompute_output)
@@ -465,6 +477,7 @@ def _mamba_chunk_scan_combined_bwd(dout, x, dt, A, B, C, out, chunk_size, D=None
         dstates_dtype=x.dtype,
         states_dtype=x.dtype,
         chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
     )
     # dstates has length nchunks, containing the gradient to states of chunk 0 at index 0 and
     # gradient to the final states at index (nchunks - 1)
@@ -600,7 +613,7 @@ class MambaChunkScanCombinedFn(torch.autograd.Function):
         else:
             assert cu_seqlens is not None, "cu_seqlens must be provided if return_varlen_states is True"
         out, out_x, dt_out, dA_cumsum, states, final_states, *rest = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, dt_softplus=dt_softplus, dt_limit=dt_limit)
-        ctx.save_for_backward(out if z is None else out_x, x, dt, dA_cumsum, A, B, C, D, z, dt_bias, initial_states, seq_idx)
+        ctx.save_for_backward(out if z is None else out_x, x, dt, dA_cumsum, A, B, C, D, z, dt_bias, initial_states, seq_idx, cu_seqlens)
         ctx.dt_softplus = dt_softplus
         ctx.chunk_size = chunk_size
         ctx.dt_limit = dt_limit
@@ -614,15 +627,17 @@ class MambaChunkScanCombinedFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        out, x, dt, dA_cumsum, A, B, C, D, z, dt_bias, initial_states, seq_idx = ctx.saved_tensors
+        out, x, dt, dA_cumsum, A, B, C, D, z, dt_bias, initial_states, seq_idx, cu_seqlens = ctx.saved_tensors
         assert not ctx.return_varlen_states, "return_varlen_states is not supported in backward"
         dfinal_states = args[0] if ctx.return_final_states else None
-        dx, ddt, dA, dB, dC, dD, dz, ddt_bias, dinitial_states = _mamba_chunk_scan_combined_bwd(dout, x, dt, A, B, C, out, ctx.chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, dfinal_states=dfinal_states, seq_idx=seq_idx, dt_softplus=ctx.dt_softplus, dt_limit=ctx.dt_limit)
+        dx, ddt, dA, dB, dC, dD, dz, ddt_bias, dinitial_states = _mamba_chunk_scan_combined_bwd(dout, x, dt, A, B, C, out, ctx.chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, dfinal_states=dfinal_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, dt_softplus=ctx.dt_softplus, dt_limit=ctx.dt_limit)
         return dx, ddt, dA, dB, dC, None, dD, dz, ddt_bias, dinitial_states, None, None, None, None, None, None
 
 
 def mamba_chunk_scan_combined(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, cu_seqlens=None, dt_softplus=False, dt_limit=(0.0, float("inf")), return_final_states=False, return_varlen_states=False):
     """
+    Mamba chunk scan with optional per-sequence initial states for packed sequences.
+    
     Argument:
         x: (batch, seqlen, nheads, headdim)
         dt: (batch, seqlen, nheads)
@@ -633,12 +648,38 @@ def mamba_chunk_scan_combined(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bia
         D: (nheads, headdim) or (nheads,)
         z: (batch, seqlen, nheads, headdim)
         dt_bias: (nheads,)
-        initial_states: (batch, nheads, headdim, dstate)
-        seq_idx: (batch, seqlen)
-        cu_seqlens: (num_sequences + 1) or None, only used if return_varlen_states is True
+        initial_states: Initial hidden states
+            - Standard mode: (batch, nheads, headdim, dstate)
+            - Packed sequences mode (with cu_seqlens): (num_sequences, nheads, headdim, dstate)
+              Allows different initial states for each sequence in the packed batch
+        seq_idx: (batch, seqlen) - required when cu_seqlens is provided
+        cu_seqlens: (num_sequences + 1) or None
+                    Cumulative sequence lengths for packed sequences (e.g., [0, 128, 384, 512])
+                    When provided, batch must be 1 and seq_idx must be provided
         dt_softplus: Whether to apply softplus to dt
+        return_final_states: Whether to return final states
+        return_varlen_states: Whether to return per-sequence states (requires cu_seqlens)
+    
     Return:
         out: (batch, seqlen, nheads, headdim)
+        final_states: (batch, nheads, headdim, dstate) if return_final_states is True
+        varlen_states: (num_sequences, nheads, headdim, dstate) if return_varlen_states is True
+    
+    Examples:
+        # Standard mode with single initial state
+        out = mamba_chunk_scan_combined(x, dt, A, B, C, chunk_size, 
+                                        initial_states=torch.randn(batch, nheads, headdim, dstate))
+        
+        # Packed sequences with per-sequence initial states
+        cu_seqlens = torch.tensor([0, 128, 384, 512], dtype=torch.int32)  # 3 sequences
+        initial_states = torch.randn(3, nheads, headdim, dstate)  # Different state per sequence
+        out, varlen_states = mamba_chunk_scan_combined(
+            x, dt, A, B, C, chunk_size,
+            initial_states=initial_states,
+            seq_idx=seq_idx,
+            cu_seqlens=cu_seqlens,
+            return_varlen_states=True
+        )
     """
     return MambaChunkScanCombinedFn.apply(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, dt_limit, return_final_states, return_varlen_states)
 

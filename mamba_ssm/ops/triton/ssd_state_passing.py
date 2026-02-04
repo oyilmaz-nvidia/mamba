@@ -42,6 +42,7 @@ def _state_passing_fwd_kernel(
     # Meta-parameters
     HAS_INITSTATES: tl.constexpr,
     HAS_SEQ_IDX: tl.constexpr,
+    VARLEN_INITSTATES: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid_b = tl.program_id(axis=1)
@@ -51,8 +52,13 @@ def _state_passing_fwd_kernel(
     dA_cs_ptr += pid_b * stride_dA_cs_batch + pid_h * stride_dA_cs_head
     out_ptr += pid_b * stride_out_batch + pid_h * stride_out_head
     final_states_ptr += pid_b * stride_final_states_batch + pid_h * stride_final_states_head
+    initstates_base_ptr = initstates_ptr
     if HAS_INITSTATES:
-        initstates_ptr += pid_b * stride_initstates_batch + pid_h * stride_initstates_head
+        if not VARLEN_INITSTATES:
+            initstates_ptr += pid_b * stride_initstates_batch + pid_h * stride_initstates_head
+        else:
+            # For varlen, we'll index by seq_idx value, not by batch
+            initstates_ptr += pid_h * stride_initstates_head
     if HAS_SEQ_IDX:
         seq_idx_ptr += pid_b * stride_seq_idx_batch
 
@@ -64,18 +70,33 @@ def _state_passing_fwd_kernel(
     if not HAS_INITSTATES:
         states = tl.zeros((BLOCK_SIZE, ), dtype=tl.float32)
     else:
-        initstates_ptrs = initstates_ptr + offs_m * stride_initstates_dim
-        states = tl.load(initstates_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
+        if not VARLEN_INITSTATES:
+            initstates_ptrs = initstates_ptr + offs_m * stride_initstates_dim
+            states = tl.load(initstates_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
+        else:
+            # For varlen with packed sequences, load initial state for first sequence (seq_idx=0)
+            seq_idx_0 = tl.load(seq_idx_ptr)
+            initstates_ptrs = initstates_base_ptr + seq_idx_0 * stride_initstates_batch + pid_h * stride_initstates_head + offs_m * stride_initstates_dim
+            states = tl.load(initstates_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
     tl.store(out_ptrs, states, mask=offs_m < dim)
     out_ptrs += stride_out_chunk
-    seq_idx = 0
+    seq_idx = tl.load(seq_idx_ptr) if HAS_SEQ_IDX else 0
     for c in range(nchunks):
         new_states = tl.load(states_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
         dA_cs = tl.load(dA_cs_ptr).to(tl.float32)
         scale = tl.exp(dA_cs)
         if HAS_SEQ_IDX:
             seq_idx_new = tl.load(seq_idx_ptr + (min((c + 1) * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
-            scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
+            if VARLEN_INITSTATES:
+                # When sequence changes, load the new sequence's initial state
+                if seq_idx_new != seq_idx:
+                    scale = 0.0
+                    # Load initial state for the new sequence
+                    initstates_ptrs_new = initstates_base_ptr + seq_idx_new * stride_initstates_batch + pid_h * stride_initstates_head + offs_m * stride_initstates_dim
+                    new_seq_init_state = tl.load(initstates_ptrs_new, mask=offs_m < dim, other=0.0).to(tl.float32)
+                    states = new_seq_init_state
+            else:
+                scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
             seq_idx = seq_idx_new
         states = scale * states + new_states
         if c < nchunks - 1:
@@ -119,6 +140,7 @@ def _state_passing_bwd_kernel(
     HAS_DFINAL_STATES: tl.constexpr,
     HAS_DINITSTATES: tl.constexpr,
     HAS_SEQ_IDX: tl.constexpr,
+    VARLEN_INITSTATES: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid_b = tl.program_id(axis=1)
@@ -133,8 +155,13 @@ def _state_passing_bwd_kernel(
         states_converted_ptr += pid_b * stride_out_batch + pid_h * stride_out_head + (nchunks - 1) * stride_out_chunk
     if HAS_DFINAL_STATES:
         dfinal_states_ptr += pid_b * stride_dfinal_states_batch + pid_h * stride_dfinal_states_head
+    dinitstates_base_ptr = dinitstates_ptr
     if HAS_DINITSTATES:
-        dinitstates_ptr += pid_b * stride_dinitstates_batch + pid_h * stride_dinitstates_head
+        if not VARLEN_INITSTATES:
+            dinitstates_ptr += pid_b * stride_dinitstates_batch + pid_h * stride_dinitstates_head
+        else:
+            # For varlen, we'll index by seq_idx value
+            dinitstates_ptr += pid_h * stride_dinitstates_head
     if HAS_SEQ_IDX:
         seq_idx_ptr += pid_b * stride_seq_idx_batch
 
@@ -158,7 +185,15 @@ def _state_passing_bwd_kernel(
         scale = tl.exp(dA_cs)
         if HAS_SEQ_IDX:
             seq_idx_new = tl.load(seq_idx_ptr + (((nchunks - c - 1) * chunk_size - 1) * stride_seq_idx_seqlen))
-            scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
+            if VARLEN_INITSTATES and seq_idx_new != seq_idx:
+                # Store gradient for this sequence's initial state
+                dinitstates_ptrs = dinitstates_base_ptr + seq_idx * stride_dinitstates_batch + pid_h * stride_dinitstates_head + offs_m * stride_dinitstates_dim
+                tl.atomic_add(dinitstates_ptrs, dstates, mask=offs_m < dim)
+                # Reset dstates for new sequence
+                dstates = tl.zeros((BLOCK_SIZE, ), dtype=tl.float32)
+                scale = 0.0
+            else:
+                scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
             seq_idx = seq_idx_new
         out = tl.load(out_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
         if CONVERT_STATES:
@@ -184,25 +219,43 @@ def _state_passing_bwd_kernel(
         dA_cs = tl.load(dA_cs_ptr).to(tl.float32)
         scale = tl.exp(dA_cs)
         if HAS_SEQ_IDX:
-            scale = tl.where(seq_idx == 0, scale, 0.0)
+            if not VARLEN_INITSTATES:
+                scale = tl.where(seq_idx == 0, scale, 0.0)
+            # For varlen, seq_idx is the current sequence index
         out = tl.load(out_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
         ddA = tl.sum(out * dstates) * scale
         tl.store(ddA_cs_ptr, ddA)
         dout = tl.load(dout_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
         dstates = scale * dstates + dout
-        tl.store(dinitstates_ptr + offs_m * stride_dinitstates_dim, dstates, mask=offs_m < dim)
+        if not VARLEN_INITSTATES:
+            tl.store(dinitstates_ptr + offs_m * stride_dinitstates_dim, dstates, mask=offs_m < dim)
+        else:
+            # Store gradient for the current sequence's initial state using atomic add
+            dinitstates_ptrs = dinitstates_base_ptr + seq_idx * stride_dinitstates_batch + pid_h * stride_dinitstates_head + offs_m * stride_dinitstates_dim
+            tl.atomic_add(dinitstates_ptrs, dstates, mask=offs_m < dim)
 
 
 def _state_passing_fwd(states, dA_chunk_cumsum, initial_states=None, seq_idx=None, chunk_size=None,
-                       out_dtype=None):
+                       out_dtype=None, cu_seqlens=None):
     batch, nchunks, nheads, dim = states.shape
     assert dA_chunk_cumsum.shape == (batch, nheads, nchunks)
+    varlen_initstates = False
     if initial_states is not None:
-        assert initial_states.shape == (batch, nheads, dim)
+        if cu_seqlens is not None:
+            # Per-sequence initial states for packed sequences
+            num_sequences = cu_seqlens.shape[0] - 1
+            assert initial_states.shape == (num_sequences, nheads, dim), \
+                f"With cu_seqlens, initial_states must have shape (num_sequences={num_sequences}, nheads={nheads}, dim={dim}), got {initial_states.shape}"
+            assert batch == 1, "cu_seqlens only supported with batch=1"
+            varlen_initstates = True
+        else:
+            assert initial_states.shape == (batch, nheads, dim)
     if seq_idx is not None:
         assert chunk_size is not None
         seqlen = seq_idx.shape[-1]
         assert seq_idx.shape == (batch, seqlen)
+    if cu_seqlens is not None:
+        assert seq_idx is not None, "seq_idx must be provided when cu_seqlens is not None"
     out_dtype = states.dtype if out_dtype is None else out_dtype
     out = torch.empty((batch, nchunks, nheads, dim), device=states.device, dtype=out_dtype)
     final_states = torch.empty((batch, nheads, dim), device=states.device, dtype=torch.float32)
@@ -220,13 +273,14 @@ def _state_passing_fwd(states, dA_chunk_cumsum, initial_states=None, seq_idx=Non
             *((seq_idx.stride(0), seq_idx.stride(1)) if seq_idx is not None else (0, 0)),
             HAS_INITSTATES=initial_states is not None,
             HAS_SEQ_IDX=seq_idx is not None,
+            VARLEN_INITSTATES=varlen_initstates,
         )
     return out, final_states
 
 
 def _state_passing_bwd(
         states, dA_chunk_cumsum, dout, dfinal_states=None, seq_idx=None, has_initial_states=None,
-        dstates_dtype=None, states_dtype=None, chunk_size=None
+        dstates_dtype=None, states_dtype=None, chunk_size=None, cu_seqlens=None
 ):
     """
     states contains the initial_states at index 0. The final states are not included in states.
@@ -234,10 +288,15 @@ def _state_passing_bwd(
     batch, nchunks, nheads, dim = states.shape
     assert dA_chunk_cumsum.shape == (batch, nheads, nchunks)
     assert dout.shape == (batch, nchunks, nheads, dim)
+    varlen_initstates = False
     if seq_idx is not None:
         assert chunk_size is not None
         seqlen = seq_idx.shape[-1]
         assert seq_idx.shape == (batch, seqlen)
+    if cu_seqlens is not None:
+        assert seq_idx is not None, "seq_idx must be provided when cu_seqlens is not None"
+        assert batch == 1, "cu_seqlens only supported with batch=1"
+        varlen_initstates = True
     dstates = torch.empty_like(dout, dtype=dstates_dtype if dstates_dtype is not None else dout.dtype)
     if states_dtype is not None and states_dtype != states.dtype:
         states_converted = torch.empty_like(states, dtype=dstates_dtype if dstates_dtype is not None else dout.dtype)
@@ -245,7 +304,12 @@ def _state_passing_bwd(
     else:
         states_converted = None
     if has_initial_states:
-        dinitstates = torch.empty_like(dstates[:, 0])
+        if varlen_initstates:
+            # Per-sequence gradients for initial states
+            num_sequences = cu_seqlens.shape[0] - 1
+            dinitstates = torch.zeros(num_sequences, nheads, dim, dtype=dout.dtype, device=dout.device)
+        else:
+            dinitstates = torch.empty_like(dstates[:, 0])
     else:
         dinitstates = None
     if dfinal_states is not None:
@@ -274,6 +338,7 @@ def _state_passing_bwd(
             HAS_DFINAL_STATES=dfinal_states is not None,
             HAS_DINITSTATES=dinitstates is not None,
             HAS_SEQ_IDX=seq_idx is not None,
+            VARLEN_INITSTATES=varlen_initstates,
         )
     BLOCK_SIZE_actual = _state_passing_bwd_kernel.best_config.kwargs["BLOCK_SIZE"]
     n_valid_blocks = (dim + BLOCK_SIZE_actual - 1) // BLOCK_SIZE_actual
