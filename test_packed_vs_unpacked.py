@@ -72,14 +72,15 @@ def test_packed_vs_unpacked():
     print("RUN 1: Processing as PACKED sequences")
     print("=" * 80)
     
-    out_packed, varlen_states_packed = mamba_chunk_scan_combined(
+    out_packed, states_packed, varlen_states_packed = mamba_chunk_scan_combined(
         x_packed, dt_packed, A, B_packed, C_packed, chunk_size,
         D=None, z=None, dt_bias=dt_bias,
         initial_states=initial_states_packed,
         seq_idx=seq_idx_packed.unsqueeze(0),
         cu_seqlens=cu_seqlens,
         dt_softplus=True,
-        return_varlen_states=True
+        return_varlen_states=True,
+        return_final_states=True,
     )
     
     print(f"✓ Packed processing succeeded!")
@@ -93,39 +94,69 @@ def test_packed_vs_unpacked():
     print("RUN 2: Processing each sequence SEPARATELY (batch mode, not packed)")
     print("=" * 80)
     
-    out_individual_list = []
-    states_individual_list = []
+    # Prepare all sequences as a regular batch (pad to max length)
+    max_seqlen = seqlens.max().item()
+    x_batch_list = []
+    B_batch_list = []
+    C_batch_list = []
+    dt_batch_list = []
     
+    print(f"\n  Preparing batch with max_seqlen={max_seqlen}...")
     for i in range(num_sequences):
         start_idx = cu_seqlens[i].item()
         end_idx = cu_seqlens[i + 1].item()
         seq_len = end_idx - start_idx
         
-        print(f"\n  Processing sequence {i} (length={seq_len})...")
-        
         # Extract this sequence's data
-        x_seq = x_packed[:, start_idx:end_idx, :, :].contiguous()
-        B_seq = B_packed[:, start_idx:end_idx, :, :].contiguous()
-        C_seq = C_packed[:, start_idx:end_idx, :, :].contiguous()
-        dt_seq = dt_packed[:, start_idx:end_idx, :].contiguous()
+        x_seq = x_packed[:, start_idx:end_idx, :, :]
+        B_seq = B_packed[:, start_idx:end_idx, :, :]
+        C_seq = C_packed[:, start_idx:end_idx, :, :]
+        dt_seq = dt_packed[:, start_idx:end_idx, :]
         
-        # Use this sequence's initial state
-        initial_state_seq = initial_states_packed[i:i+1, :, :, :].contiguous()
+        # Pad to max length if necessary
+        if seq_len < max_seqlen:
+            pad_len = max_seqlen - seq_len
+            x_seq = F.pad(x_seq, (0, 0, 0, 0, 0, pad_len))
+            B_seq = F.pad(B_seq, (0, 0, 0, 0, 0, pad_len))
+            C_seq = F.pad(C_seq, (0, 0, 0, 0, 0, pad_len))
+            dt_seq = F.pad(dt_seq, (0, 0, 0, pad_len))
         
-        # Process in standard batch mode (not packed)
-        out_seq, final_state_seq = mamba_chunk_scan_combined(
-            x_seq, dt_seq, A, B_seq, C_seq, chunk_size,
-            D=None, z=None, dt_bias=dt_bias,
-            initial_states=initial_state_seq,
-            seq_idx=None,
-            cu_seqlens=None,
-            dt_softplus=True,
-            return_final_states=True
-        )
-        
+        x_batch_list.append(x_seq)
+        B_batch_list.append(B_seq)
+        C_batch_list.append(C_seq)
+        dt_batch_list.append(dt_seq)
+    
+    # Stack to create batch dimension
+    x_batch = torch.cat(x_batch_list, dim=0)  # (num_sequences, max_seqlen, nheads, headdim)
+    B_batch = torch.cat(B_batch_list, dim=0)  # (num_sequences, max_seqlen, ngroups, dstate)
+    C_batch = torch.cat(C_batch_list, dim=0)  # (num_sequences, max_seqlen, ngroups, dstate)
+    dt_batch = torch.cat(dt_batch_list, dim=0)  # (num_sequences, max_seqlen, nheads)
+    
+    print(f"  Batch shapes: x={x_batch.shape}, B={B_batch.shape}, C={C_batch.shape}, dt={dt_batch.shape}")
+    
+    # Call mamba_chunk_scan_combined once with full batch
+    print(f"\n  Processing all sequences in single batch call...")
+    out_batch, states_batch = mamba_chunk_scan_combined(
+        x_batch, dt_batch, A, B_batch, C_batch, chunk_size,
+        D=None, z=None, dt_bias=dt_bias,
+        initial_states=initial_states_packed,
+        seq_idx=None,
+        cu_seqlens=None,
+        dt_softplus=True,
+        return_final_states=True
+    )
+    
+    print(f"  ✓ Batch processing completed: out_shape={out_batch.shape}, states_shape={states_batch.shape}")
+    
+    # Unpack results (trim padding and split into individual sequences)
+    out_individual_list = []
+    states_individual_list = []
+    for i in range(num_sequences):
+        seq_len = seqlens[i].item()
+        out_seq = out_batch[i:i+1, :seq_len, :, :].contiguous()
+        state_seq = states_batch[i:i+1, :, :, :].contiguous()
         out_individual_list.append(out_seq)
-        states_individual_list.append(final_state_seq)
-        print(f"    ✓ Sequence {i} processed: out_shape={out_seq.shape}, state_shape={final_state_seq.shape}")
+        states_individual_list.append(state_seq)
     
     # Concatenate results
     out_individual = torch.cat(out_individual_list, dim=1)
@@ -146,7 +177,21 @@ def test_packed_vs_unpacked():
     out_diff = (out_packed - out_individual).abs()
     out_max_diff = out_diff.max().item()
     out_mean_diff = out_diff.mean().item()
+
+    print(f"out_packed: {out_packed[0][0][1][:10].tolist()}")
+    print("--------------------------------")
+    print(f"out_individual: {out_individual[0][0][1][:10].tolist()}")
     
+    #print("")
+    #print(f"out_packed: {states_packed[0][0][0][:10].tolist()}")
+    #print("--------------------------------")
+    #print(f"states_individual: {states_batch[0][0][0][:10].tolist()}")
+
+    print("Shape of states_packed: ", states_packed.shape)
+    print("Shape of states_batch: ", states_batch.shape)
+    print("Shape of varlen_states_packed: ", varlen_states_packed.shape)
+    print("Shape of states_individual: ", states_individual.shape)
+
     # Compare states
     states_diff = (varlen_states_packed - states_individual).abs()
     states_max_diff = states_diff.max().item()

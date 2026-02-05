@@ -54,7 +54,6 @@ def _state_passing_fwd_kernel(
     final_states_ptr += pid_b * stride_final_states_batch + pid_h * stride_final_states_head
     initstates_base_ptr = initstates_ptr
     if HAS_INITSTATES:
-        print("stride_initstates_batch: ", stride_initstates_batch)
         if not VARLEN_INITSTATES:
             initstates_ptr += pid_b * stride_initstates_batch + pid_h * stride_initstates_head
         else:
