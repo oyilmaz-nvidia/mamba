@@ -194,11 +194,15 @@ def _state_passing_bwd_kernel(
 
 
 def _state_passing_fwd(states, dA_chunk_cumsum, initial_states=None, seq_idx=None, chunk_size=None,
-                       out_dtype=None):
+                       cu_seqlens=None, out_dtype=None):
     batch, nchunks, nheads, dim = states.shape
     assert dA_chunk_cumsum.shape == (batch, nheads, nchunks)
     if initial_states is not None:
-        assert initial_states.shape == (batch, nheads, dim)
+        if cu_seqlens is not None:
+            sequence_lengths = len(cu_seqlens) - 1
+            assert initial_states.shape == (sequence_lengths, nheads, dim)
+        else:
+            assert initial_states.shape == (batch, nheads, dim)
     if seq_idx is not None:
         assert chunk_size is not None
         seqlen = seq_idx.shape[-1]
